@@ -172,8 +172,9 @@ numbers of models such as DeepGaze III.
 - **First fixation.** The first ground-truth fixation (the initial central
   fixation) is only used as history and is not scored.
 - **Checkpoint selection.** The bundled checkpoints were selected by eval loss on
-  the `scanpath_val_*` splits (see `configs/`). Report results on data that was
-  not used for this selection.
+  their validation splits (`scanpath_val_*` for the free-viewing adapter,
+  `scanpath_search_val` for the visual-search adapter, see `configs/`). Report
+  results on data that was not used for this selection.
 - **Failures are not skipped.** A missing image, center-bias prior or any other
   error stops the run. Results are saved after every image, so a run can be
   continued with `--resume-json`.

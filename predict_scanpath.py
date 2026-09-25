@@ -10,6 +10,14 @@ This is a pure inference script: image -> generated scanpath. It computes no
 metrics (no Information Gain / AUC / NSS), uses no centerbias, and does no grid
 probing. A single autoregressive generation call produces the scanpath.
 
+By default the scanpath is sampled (temperature 1.0), i.e. it is one draw from the
+model's distribution over human scanpaths. Greedy decoding (--temperature 0) picks
+the most likely next token at every step; the result is deterministic and not a
+typical sample of human scanpaths.
+In the free-viewing training data the first fixation is the initial central
+fixation of the eye-tracking setup, so the first generated point is (close to)
+the image center.
+
 Model loading and prompt construction exactly mirror the evaluation path in
 evaluate_vllm_unified.py (imported, not reimplemented).
 
@@ -145,8 +153,9 @@ def parse_args():
     )
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL,
                         help=f"Base model (default: {DEFAULT_BASE_MODEL}).")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature (default: 0.0 = greedy).")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature (default: 1.0 = sample from the model's "
+                             "distribution; 0.0 = greedy).")
     parser.add_argument("--seed", type=int, default=42, help="Sampling seed (default: 42).")
     parser.add_argument("--max-model-len", type=int, default=4096,
                         help="Maximum context length (default: 4096).")
@@ -154,6 +163,9 @@ def parse_args():
                         help="Maximum concurrent sequences (default: 32).")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
                         help="Fraction of GPU memory to use (default: 0.90).")
+    parser.add_argument("--dtype", default="auto",
+                        help="vLLM dtype (default: auto = bf16 of the merged model; "
+                             "use half on GPUs without bf16 support).")
     parser.add_argument("--output", default=None,
                         help="Optional path to write a JSON result file.")
     parser.add_argument("--save-overlay", default=None,
@@ -212,11 +224,10 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
+        dtype=args.dtype,
     )
 
-    from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(args.base_model, trust_remote_code=True)
-    builder = FewShotPromptBuilder(processor)
+    builder = FewShotPromptBuilder()
 
     prompt_str, mm_data = builder.build_prompt(
         test_image=img,

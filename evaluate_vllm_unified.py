@@ -568,11 +568,26 @@ class ShotSelector:
 # Few-Shot Prompt Builder
 # =============================================================================
 
-class FewShotPromptBuilder:
-    """Builds multi-turn prompts for few-shot scanpath evaluation."""
+# The adapters in model/ were trained with LlamaFactory's `intern_vl` template
+# (configs/*.yaml). Prompts must reproduce it exactly: the template's default system
+# prompt (the training data has no system turn, so LlamaFactory inserts this one) and
+# the image placeholder directly followed by the text. vLLM expands the single
+# <IMG_CONTEXT> into <img><IMG_CONTEXT>*256</img>, as LlamaFactory did during training.
+INTERNVL_DEFAULT_SYSTEM = (
+    "你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。"
+)
+INTERNVL_IMAGE_TOKEN = "<IMG_CONTEXT>"
 
-    def __init__(self, processor):
-        self.processor = processor
+
+class FewShotPromptBuilder:
+    """Builds multi-turn prompts in the training format (LlamaFactory `intern_vl`)."""
+
+    def __init__(self, system_prompt: str = INTERNVL_DEFAULT_SYSTEM):
+        self.system_prompt = system_prompt
+
+    @staticmethod
+    def _user_turn(text: str) -> str:
+        return f"<|im_start|>user\n{INTERNVL_IMAGE_TOKEN}{text}<|im_end|>\n<|im_start|>assistant\n"
 
     def build_prompt(
         self,
@@ -592,37 +607,21 @@ class FewShotPromptBuilder:
         Returns:
             Tuple of (formatted_prompt_string, mm_data_dict)
         """
-        messages = []
+        parts = []
         images = []
 
+        if self.system_prompt:
+            parts.append(f"<|im_start|>system\n{self.system_prompt}<|im_end|>\n")
+
         for ex in shot_examples:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": ex['prompt']}
-                ]
-            })
-            messages.append({
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": ex['response']}
-                ]
-            })
+            parts.append(self._user_turn(ex['prompt']))
+            parts.append(f"{ex['response']}<|im_end|>\n")
             images.append(ex['image'])
 
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": test_prompt}
-            ]
-        })
+        parts.append(self._user_turn(test_prompt))
         images.append(test_image)
 
-        prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt = "".join(parts)
 
         if len(images) == 1:
             mm_data = {"image": images[0]}
@@ -644,11 +643,7 @@ def prepare_shot_examples(
         response = conv[1]['value']
 
         image_path = os.path.join(images_dir, sample['images'][0])
-        try:
-            image = Image.open(image_path).convert('RGB')
-        except Exception as e:
-            print(f"Warning: Could not load shot image {image_path}: {e}")
-            continue
+        image = Image.open(image_path).convert('RGB')
 
         result.append({
             'image': image,
@@ -674,32 +669,15 @@ class SaliencyComputer:
     def __init__(
         self,
         llm,
-        processor=None,
         prompt_builder: Optional[FewShotPromptBuilder] = None,
         lora_request=None,
         normalize_digits: bool = False,
     ):
         self.llm = llm
-        self.processor = processor
-        self.prompt_builder = prompt_builder
+        self.prompt_builder = prompt_builder if prompt_builder is not None else FewShotPromptBuilder()
         self.lora_request = lora_request
         self.normalize_digits = normalize_digits
         self._xy_separator = None  # Auto-detected: ", " or ","
-
-        if processor is None:
-            try:
-                from transformers import AutoProcessor
-                model_path = llm.llm_engine.model_config.model
-                self.processor = AutoProcessor.from_pretrained(
-                    model_path, trust_remote_code=True
-                )
-            except Exception as e:
-                print(f"Warning: Could not load processor: {e}")
-
-        self.tokenizer = self.processor.tokenizer if self.processor else None
-
-        if self.prompt_builder is None and self.processor is not None:
-            self.prompt_builder = FewShotPromptBuilder(self.processor)
 
         self.format_partial_scanpath = format_partial_scanpath_reduced
         self.format_coordinate = format_coordinate_reduced
@@ -1712,47 +1690,44 @@ def create_center_bias(shape: Tuple[int, int] = (100, 100), sigma: float = 20.0)
 
 def load_centerbias_from_pkl(
     image_name: str, pkl_dir: str, resolution: int = 100
-) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """Load centerbias from pkl file and resize to evaluation grid."""
+) -> Tuple[np.ndarray, str]:
+    """Load centerbias from pkl file and resize to evaluation grid.
+
+    Raises if the prior cannot be loaded: silently substituting the synthetic
+    center bias for some images would mix two different IG baselines in one result.
+    """
     basename = os.path.basename(image_name)
     name_without_ext = os.path.splitext(basename)[0]
 
     parts = name_without_ext.rsplit('_', 1)
     if len(parts) != 2:
-        return None, None
+        raise ValueError(
+            f"Cannot derive the center-bias pkl of image '{image_name}' "
+            f"(expected a name of the form DATASET_index)"
+        )
 
     dataset_name, index_str = parts
-
-    dataset_map = {
-        'MIT': 'MIT', 'CAT': 'CAT', 'CAT2000': 'CAT',
-        'COCO': 'COCO', 'Daemons': 'Daemons', 'Figrim': 'Figrim',
-    }
-    dataset = dataset_map.get(dataset_name, dataset_name)
+    dataset = DATASET_MAP.get(dataset_name, dataset_name)
 
     pkl_path = os.path.join(pkl_dir, dataset, f"{index_str}.pkl")
 
     if not os.path.exists(pkl_path):
-        return None, None
+        raise FileNotFoundError(f"No center-bias prior for image '{image_name}': {pkl_path} does not exist")
 
-    try:
-        with open(pkl_path, 'rb') as f:
-            data = pickle.load(f)
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
 
-        centerbias = np.array(data['centerbias'])
+    centerbias = np.array(data['centerbias'])
 
-        density = np.exp(centerbias - centerbias.max())
-        zoom_y = resolution / density.shape[0]
-        zoom_x = resolution / density.shape[1]
-        density_resized = zoom(density, (zoom_y, zoom_x), order=1)
-        density_resized = density_resized / density_resized.sum()
-        density_resized = np.clip(density_resized, 1e-10, None)
-        log_density_resized = np.log(density_resized)
+    density = np.exp(centerbias - centerbias.max())
+    zoom_y = resolution / density.shape[0]
+    zoom_x = resolution / density.shape[1]
+    density_resized = zoom(density, (zoom_y, zoom_x), order=1)
+    density_resized = density_resized / density_resized.sum()
+    density_resized = np.clip(density_resized, 1e-10, None)
+    log_density_resized = np.log(density_resized)
 
-        return log_density_resized, pkl_path
-
-    except Exception as e:
-        print(f"Warning: Failed to load centerbias from {pkl_path}: {e}")
-        return None, None
+    return log_density_resized, pkl_path
 
 
 # =============================================================================
@@ -1827,6 +1802,80 @@ def compute_log_nss(
     if std > 0:
         return float((log_density[y_idx, x_idx] - mean) / std)
     return 0.0
+
+
+# =============================================================================
+# Aggregation
+# =============================================================================
+
+def _fixation_metrics(result: Dict) -> Dict[str, List[float]]:
+    """Per-transition metric values of one scored scanpath, keyed by metric name."""
+    metrics: Dict[str, List[float]] = {}
+    if result.get('lp_fixation_metrics'):  # grid mode
+        fixation_metrics = result['lp_fixation_metrics']
+        metrics['IG (bits)'] = [m['ig'] for m in fixation_metrics]
+        metrics['LL (nats, 100x100 grid)'] = [m['ll'] for m in fixation_metrics]
+        metrics['AUC'] = [m['auc'] for m in fixation_metrics]
+        metrics['NSS'] = [m['nss'] for m in fixation_metrics]
+        metrics['LogNSS'] = [m['log_nss'] for m in fixation_metrics]
+    if result.get('lp_fixation_igs'):  # fast mode
+        metrics['IG (bits)'] = list(result['lp_fixation_igs'])
+        metrics['LL (nats, 100x100 grid)'] = list(result['lp_fixation_lls'])
+    if result.get('temporal_fixation_lls'):
+        metrics['Temporal LL (nats)'] = list(result['temporal_fixation_lls'])
+    if result.get('duration_fixation_lls'):
+        metrics['Duration LL (nats)'] = list(result['duration_fixation_lls'])
+    if result.get('duration_pred') is not None and result.get('duration_gt') is not None:
+        metrics['Duration SE (ms^2)'] = [
+            float((p - g) ** 2) for p, g in zip(result['duration_pred'], result['duration_gt'])
+        ]
+    return metrics
+
+
+def summarize_results(results: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """Aggregate per-transition metrics over all scored scanpaths.
+
+    Three averages are reported: over fixations (the pysaliency / DeepGaze convention,
+    every scored fixation weighted equally), over images, and over scanpaths (the mean of
+    per-scanpath means, where a scanpath with one transition weighs as much as one with
+    twelve).
+    """
+    per_fixation: Dict[str, List[float]] = defaultdict(list)
+    per_image: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    per_scanpath: Dict[str, List[float]] = defaultdict(list)
+
+    for result in results:
+        for name, values in _fixation_metrics(result).items():
+            per_fixation[name].extend(values)
+            per_image[name][result['image']].extend(values)
+            per_scanpath[name].append(float(np.mean(values)))
+
+    summary = {}
+    for name, values in per_fixation.items():
+        summary[name] = {
+            'per_fixation': float(np.mean(values)),
+            'per_image': float(np.mean([np.mean(v) for v in per_image[name].values()])),
+            'per_scanpath': float(np.mean(per_scanpath[name])),
+            'num_fixations': len(values),
+            'num_images': len(per_image[name]),
+            'num_scanpaths': len(per_scanpath[name]),
+        }
+    return summary
+
+
+def print_summary(summary: Dict[str, Dict[str, float]]):
+    if not summary:
+        print("No scored fixations.")
+        return
+    print(f"\n  {'metric':<26} {'per fixation':>13} {'per image':>11} {'per scanpath':>13}")
+    for name, values in summary.items():
+        print(f"  {name:<26} {values['per_fixation']:>13.4f} {values['per_image']:>11.4f} "
+              f"{values['per_scanpath']:>13.4f}")
+    first = next(iter(summary.values()))
+    print(f"  ({first['num_fixations']} fixations, {first['num_images']} images, "
+          f"{first['num_scanpaths']} scanpaths)")
+    if 'Duration SE (ms^2)' in summary:
+        print(f"  Duration RMSE (per fixation): {np.sqrt(summary['Duration SE (ms^2)']['per_fixation']):.1f} ms")
 
 
 # =============================================================================
@@ -2108,13 +2157,17 @@ def merge_lora_adapter(base_model_path: str, adapter_path: str, output_path: str
     is_llava = 'llava' in base_model_lower
     is_qwen = 'qwen' in base_model_lower
 
+    # merge in the dtype the adapters were trained in (bf16, see configs/*.yaml); the saved
+    # config then makes vLLM run the merged model in bf16 as well (override with --dtype)
+    merge_dtype = torch.bfloat16
+
     print("\n  Loading base model on CPU (merge does not need GPU)...")
     if is_qwen:
         from transformers import AutoModelForImageTextToText
         print("  (Using AutoModelForImageTextToText for Qwen)")
         model = AutoModelForImageTextToText.from_pretrained(
             base_model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=merge_dtype,
             trust_remote_code=True,
             device_map="cpu"
         )
@@ -2126,7 +2179,7 @@ def merge_lora_adapter(base_model_path: str, adapter_path: str, output_path: str
             print(f"  (Using AutoModelForImageTextToText for Gemma3, transformers {transformers.__version__})")
             model = AutoModelForImageTextToText.from_pretrained(
                 base_model_path,
-                torch_dtype=torch.float16,
+                torch_dtype=merge_dtype,
                 trust_remote_code=True,
                 device_map="cpu"
             )
@@ -2135,7 +2188,7 @@ def merge_lora_adapter(base_model_path: str, adapter_path: str, output_path: str
             print(f"  (Using AutoModelForMultimodalLM for Gemma3, transformers {transformers.__version__})")
             model = AutoModelForMultimodalLM.from_pretrained(
                 base_model_path,
-                torch_dtype=torch.float16,
+                torch_dtype=merge_dtype,
                 trust_remote_code=True,
                 device_map="cpu"
             )
@@ -2145,7 +2198,7 @@ def merge_lora_adapter(base_model_path: str, adapter_path: str, output_path: str
         print(f"  (Using AutoModelForImageTextToText for {model_type})")
         model = AutoModelForImageTextToText.from_pretrained(
             base_model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=merge_dtype,
             trust_remote_code=True,
             device_map="cpu"
         )
@@ -2199,6 +2252,25 @@ def merge_lora_adapter(base_model_path: str, adapter_path: str, output_path: str
     print("  Freed merge model from GPU memory")
     print("="*70 + "\n")
     return output_path
+
+
+def _check_merged_dtype(merged_path: str):
+    """Refuse to reuse a merged model saved in another dtype than bf16.
+
+    Earlier versions of this script merged the adapters in float16, which vLLM then
+    also used for inference; such a directory has to be re-merged.
+    """
+    config_path = os.path.join(merged_path, "config.json")
+    if not os.path.exists(config_path):
+        return
+    with open(config_path) as f:
+        config = json.load(f)
+    saved_dtype = config.get("torch_dtype") or config.get("dtype")
+    if saved_dtype is not None and saved_dtype != "bfloat16":
+        raise RuntimeError(
+            f"{merged_path} was merged in {saved_dtype}, but the adapters were trained in bfloat16. "
+            f"Delete the directory so that it is re-merged in bfloat16."
+        )
 
 
 def resolve_adapter_path(adapter_path: str) -> Tuple[str, Dict]:
@@ -2294,6 +2366,7 @@ def load_model_vllm(
     max_num_seqs: int = 256,
     enforce_eager: bool = False,
     max_lora_rank: int = 64,
+    dtype: str = "auto",
 ):
     """Unified model loader supporting base, LoRA (merged), and QLoRA (native LoRA).
 
@@ -2311,6 +2384,8 @@ def load_model_vllm(
         max_num_seqs: Maximum concurrent sequences
         enforce_eager: Disable CUDA graphs
         max_lora_rank: Maximum LoRA rank for native LoRA
+        dtype: vLLM dtype ("auto" = dtype of the model config, bf16 for merged adapters;
+            use "half" on GPUs without bf16 support)
 
     Returns:
         (llm, lora_request) tuple. lora_request is None unless use_native_lora.
@@ -2347,6 +2422,7 @@ def load_model_vllm(
             enforce_eager=enforce_eager,
             enable_lora=True,
             max_lora_rank=max_lora_rank,
+            dtype=dtype,
         )
 
         if quantization:
@@ -2371,6 +2447,7 @@ def load_model_vllm(
         merged_path = f"{adapter_path}_merged"
 
         if os.path.isdir(merged_path):
+            _check_merged_dtype(merged_path)
             print(f"Using existing merged model: {merged_path}")
         else:
             merge_lora_adapter(base_model, adapter_path, merged_path)
@@ -2394,6 +2471,7 @@ def load_model_vllm(
     print(f"  Prefix caching: {enable_prefix_caching}")
     print(f"  Max num seqs: {max_num_seqs}")
     print(f"  Enforce eager: {enforce_eager}")
+    print(f"  Dtype: {dtype}")
 
     llm_kwargs = dict(
         model=model_path,
@@ -2405,6 +2483,7 @@ def load_model_vllm(
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
         enforce_eager=enforce_eager,
+        dtype=dtype,
     )
 
     base_model_lower = base_model.lower()
@@ -2441,7 +2520,7 @@ def main():
     # Data
     parser.add_argument('--val-json', type=str, required=True,
                         help='Path to validation JSON file (LlamaFactory format)')
-    parser.add_argument('--images-dir', type=str, default='/mnt/lustre/work/bethge/bkr710/projects/lvlm-gaze/llamafactory_data_scanpath_v2_lodo',
+    parser.add_argument('--images-dir', type=str, required=True,
                         help='Base directory for images')
     parser.add_argument('--output-dir', type=str, default='eval_unified_outputs')
 
@@ -2463,8 +2542,10 @@ def main():
                              'probing. grid: full 100x100 grid (adds AUC/NSS, slower).')
 
     # Centerbias
-    parser.add_argument('--pkl-dir', type=str, default='/mnt/lustre/work/bethge/bkr710/projects/deepgaze-iccv/tmp_datasets_withsubj',
-                        help='Directory with pkl files for data-driven centerbias')
+    parser.add_argument('--pkl-dir', type=str, default=None,
+                        help='Directory with pkl files for data-driven centerbias (IG baseline). '
+                             'Every image needs a prior. Without it, a synthetic Gaussian '
+                             'centerbias is used for all images.')
     parser.add_argument('--centerbias-alpha', type=float, default=None,
                         help='Centerbias augmentation weight (0 = pure model)')
 
@@ -2482,6 +2563,9 @@ def main():
     parser.add_argument('--enforce-eager', action='store_true', default=False,
                         help='Disable CUDA graphs')
     parser.add_argument('--no-enforce-eager', dest='enforce_eager', action='store_false')
+    parser.add_argument('--dtype', type=str, default='auto',
+                        help='vLLM dtype (default: auto = bf16 of the merged model; '
+                             'use half on GPUs without bf16 support)')
 
     # Visualization
     parser.add_argument('--skip-viz', action='store_true')
@@ -2517,6 +2601,11 @@ def main():
         parser.error("--shot-pool-json is required when --num-shots > 0")
     if args.shot_strategy == 'subjective' and not args.pkl_dir:
         parser.error("--pkl-dir is required for subjective strategy")
+    if args.pkl_dir is not None and not os.path.isdir(args.pkl_dir):
+        parser.error(f"--pkl-dir does not exist: {args.pkl_dir}")
+    if 'internvl' not in args.base_model.lower():
+        parser.error("prompts are built in the LlamaFactory intern_vl training format; "
+                     "only InternVL base models are supported")
 
     # Resolve adapter path (auto-detect best checkpoint if given a training root)
     _adapter_info = {}
@@ -2601,25 +2690,13 @@ def main():
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         enforce_eager=args.enforce_eager,
+        dtype=args.dtype,
     )
 
-    # Get processor
-    from transformers import AutoProcessor
-    # Use the actual loaded model path for processor (may be merged path)
-    processor_model = args.base_model
-    try:
-        processor = AutoProcessor.from_pretrained(
-            processor_model, trust_remote_code=True
-        )
-    except Exception as e:
-        print(f"Warning: Could not load processor: {e}")
-        processor = None
-
-    # Create saliency computer
-    prompt_builder = FewShotPromptBuilder(processor) if processor else None
+    # Create saliency computer (prompts in the training format, see FewShotPromptBuilder)
     saliency_computer = SaliencyComputer(
-        llm, processor,
-        prompt_builder=prompt_builder,
+        llm,
+        prompt_builder=FewShotPromptBuilder(),
         lora_request=lora_request,
         normalize_digits=args.normalize_digits,
     )
@@ -2654,12 +2731,12 @@ def main():
     # =========================================================================
     # Center bias
     # =========================================================================
-    default_center_bias = create_center_bias((args.resolution, args.resolution))
-    use_data_centerbias = args.pkl_dir is not None and os.path.exists(args.pkl_dir)
+    synthetic_center_bias = create_center_bias((args.resolution, args.resolution))
+    use_data_centerbias = args.pkl_dir is not None
     if use_data_centerbias:
         print(f"Using data-driven centerbias from: {args.pkl_dir}")
     else:
-        print("Using synthetic Gaussian centerbias (sigma=20)")
+        print("No --pkl-dir given: IG baseline is a synthetic Gaussian centerbias (sigma=20) for all images")
 
     # Centerbias alpha
     centerbias_alpha = 0.0
@@ -2679,8 +2756,7 @@ def main():
             sample = val_data[i]
             image_path = Path(args.images_dir) / sample['images'][0]
             if not image_path.exists():
-                print(f"Image not found: {image_path}")
-                continue
+                raise FileNotFoundError(f"Image not found: {image_path}")
 
             image = Image.open(image_path).convert('RGB')
             conv = sample['conversations']
@@ -2721,17 +2797,20 @@ def main():
             print(f"Resuming from {resume_path}: {len(all_results)} samples already completed")
             results_file = resume_path
         else:
-            print(f"Warning: resume file not found: {resume_path}, starting fresh")
+            raise FileNotFoundError(f"Resume file not found: {resume_path}")
 
-    def _save_results_json():
+    def _save_results_json(summary=None):
+        data = {
+            'config': vars(args),
+            'centerbias_alpha': centerbias_alpha,
+            'metric_mode': args.metric_mode,
+            'num_samples': len(all_results),
+            'results': all_results,
+        }
+        if summary is not None:
+            data['summary'] = summary
         with open(results_file, 'w') as f:
-            json.dump({
-                'config': vars(args),
-                'centerbias_alpha': centerbias_alpha,
-                'metric_mode': args.metric_mode,
-                'num_samples': len(all_results),
-                'results': all_results,
-            }, f, indent=2, default=str)
+            json.dump(data, f, indent=2, default=str)
 
     _save_results_json()
     print(f"Results file: {results_file}")
@@ -2745,314 +2824,304 @@ def main():
     completed_sample_indices = {r['idx'] for r in all_results}
 
     for image_path, group_samples in tqdm(image_groups.items(), desc="Evaluating images"):
-        try:
-            if all(idx in completed_sample_indices for idx, _ in group_samples):
-                continue
+        if all(idx in completed_sample_indices for idx, _ in group_samples):
+            continue
 
-            # Load image ONCE
-            full_image_path = Path(args.images_dir) / image_path
-            if not full_image_path.exists():
-                print(f"Image not found: {full_image_path}")
-                continue
+        # Load image ONCE
+        full_image_path = Path(args.images_dir) / image_path
+        if not full_image_path.exists():
+            raise FileNotFoundError(f"Image not found: {full_image_path}")
 
-            image = Image.open(full_image_path).convert('RGB')
+        image = Image.open(full_image_path).convert('RGB')
 
-            # Load centerbias ONCE
-            if use_data_centerbias:
-                center_bias, pkl_path = load_centerbias_from_pkl(
-                    image_path, args.pkl_dir, args.resolution
-                )
-                cb_source = 'data' if center_bias is not None else 'synthetic'
-                if center_bias is None:
-                    center_bias = default_center_bias
-                    pkl_path = None
-            else:
-                center_bias = default_center_bias
-                cb_source = 'synthetic'
-                pkl_path = None
-
-            # Select shots ONCE
-            selected_shots = shot_selector.select(
-                shot_pool, args.num_shots, args.shot_strategy,
-                test_sample=group_samples[0][1]
+        # Load centerbias ONCE
+        if use_data_centerbias:
+            center_bias, pkl_path = load_centerbias_from_pkl(
+                image_path, args.pkl_dir, args.resolution
             )
-            shot_examples = prepare_shot_examples(selected_shots, args.images_dir)
+            cb_source = 'data'
+        else:
+            center_bias = synthetic_center_bias
+            cb_source = 'synthetic'
+            pkl_path = None
 
-            # Collect valid scanpaths
-            valid_entries = []
-            for idx, sample in group_samples:
-                conv = sample['conversations']
-                text_prompt = conv[0]['value'].replace("<image>", "").strip()
-                gt_scanpath_str = conv[1]['value']
-                gt_fixations = parse_scanpath_reduced(gt_scanpath_str)
+        # Select shots ONCE
+        selected_shots = shot_selector.select(
+            shot_pool, args.num_shots, args.shot_strategy,
+            test_sample=group_samples[0][1]
+        )
+        shot_examples = prepare_shot_examples(selected_shots, args.images_dir)
 
-                # Parse temporal/duration data if available
-                gt_temporal = None
-                gt_durations = None
-                if is_temporal:
-                    gt_temporal = parse_scanpath_temporal(gt_scanpath_str)
-                elif is_durations:
-                    gt_durations = parse_scanpath_temporal(gt_scanpath_str)  # Same 3-tuple regex
+        # Collect valid scanpaths
+        valid_entries = []
+        for idx, sample in group_samples:
+            conv = sample['conversations']
+            text_prompt = conv[0]['value'].replace("<image>", "").strip()
+            gt_scanpath_str = conv[1]['value']
+            gt_fixations = parse_scanpath_reduced(gt_scanpath_str)
 
-                if len(gt_fixations) < 2:
-                    print(f"Sample {idx}: Not enough fixations ({len(gt_fixations)})")
-                    continue
-                valid_entries.append((idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations))
+            # Parse temporal/duration data if available
+            gt_temporal = None
+            gt_durations = None
+            if is_temporal:
+                gt_temporal = parse_scanpath_temporal(gt_scanpath_str)
+            elif is_durations:
+                gt_durations = parse_scanpath_temporal(gt_scanpath_str)  # Same 3-tuple regex
 
-            if not valid_entries:
+            if len(gt_fixations) < 2:
+                print(f"Sample {idx}: Not enough fixations ({len(gt_fixations)})")
                 continue
+            valid_entries.append((idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations))
 
-            # Build result dicts
-            group_results = []
-            for idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations in valid_entries:
-                result = {
-                    'idx': idx,
-                    'image': image_path,
-                    'num_fixations': len(gt_fixations),
-                    'gt_fixations': gt_fixations,
-                    'num_shots': len(shot_examples),
-                    'shot_images': [s['images'][0] for s in selected_shots] if selected_shots else [],
-                    'centerbias_source': cb_source,
-                }
-                if is_temporal and gt_temporal:
-                    result['is_temporal'] = True
-                    result['gt_timestamps'] = [t for _, _, t in gt_temporal]
-                if is_durations and gt_durations:
-                    result['is_durations'] = True
-                    result['gt_durations'] = [d for _, _, d in gt_durations]
-                if pkl_path:
-                    result['centerbias_pkl'] = pkl_path
-                group_results.append(result)
+        if not valid_entries:
+            continue
 
-            text_prompts = [tp for _, _, tp, _, _, _ in valid_entries]
-            all_gt_fixations = [gf for _, _, _, gf, _, _ in valid_entries]
-            total_transitions = sum(len(gf) - 1 for gf in all_gt_fixations)
+        # Build result dicts
+        group_results = []
+        for idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations in valid_entries:
+            result = {
+                'idx': idx,
+                'image': image_path,
+                'num_fixations': len(gt_fixations),
+                'gt_fixations': gt_fixations,
+                'num_shots': len(shot_examples),
+                'shot_images': [s['images'][0] for s in selected_shots] if selected_shots else [],
+                'centerbias_source': cb_source,
+            }
+            if is_temporal and gt_temporal:
+                result['is_temporal'] = True
+                result['gt_timestamps'] = [t for _, _, t in gt_temporal]
+            if is_durations and gt_durations:
+                result['is_durations'] = True
+                result['gt_durations'] = [d for _, _, d in gt_durations]
+            if pkl_path:
+                result['centerbias_pkl'] = pkl_path
+            group_results.append(result)
 
-            print(
-                f"  Image {image_path}: {len(valid_entries)} scanpaths, "
-                f"{total_transitions} transitions, cb={cb_source}, mode={args.metric_mode}",
-                flush=True
+        text_prompts = [tp for _, _, tp, _, _, _ in valid_entries]
+        all_gt_fixations = [gf for _, _, _, gf, _, _ in valid_entries]
+        total_transitions = sum(len(gf) - 1 for gf in all_gt_fixations)
+
+        print(
+            f"  Image {image_path}: {len(valid_entries)} scanpaths, "
+            f"{total_transitions} transitions, cb={cb_source}, mode={args.metric_mode}",
+            flush=True
+        )
+
+        _group_t0 = _time.time()
+
+        # =================================================================
+        # GRID MODE
+        # =================================================================
+        if args.metric_mode == 'grid':
+            all_scanpath_grids = saliency_computer.compute_multi_scanpath_distributions(
+                image, text_prompts, shot_examples,
+                all_gt_fixations, args.resolution, args.batch_size
             )
 
-            _group_t0 = _time.time()
+            for (idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations), result, scanpath_grids in zip(
+                valid_entries, group_results, all_scanpath_grids
+            ):
+                fixation_metrics = []
+                saved_grids = []
+                for i, log_density in enumerate(scanpath_grids):
+                    target = gt_fixations[i + 1]
 
-            # =================================================================
-            # GRID MODE
-            # =================================================================
-            if args.metric_mode == 'grid':
-                all_scanpath_grids = saliency_computer.compute_multi_scanpath_distributions(
-                    image, text_prompts, shot_examples,
-                    all_gt_fixations, args.resolution, args.batch_size
-                )
-
-                for (idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations), result, scanpath_grids in zip(
-                    valid_entries, group_results, all_scanpath_grids
-                ):
-                    fixation_metrics = []
-                    saved_grids = []
-                    for i, log_density in enumerate(scanpath_grids):
-                        target = gt_fixations[i + 1]
-
-                        valid_mask = np.isfinite(log_density)
-                        if not valid_mask.any():
-                            continue
-                        log_density = log_density - min(0.0, logsumexp(log_density[valid_mask]))
-
-                        if centerbias_alpha > 0:
-                            log_density = log_density + centerbias_alpha * center_bias
-                            log_density = log_density - min(0.0, logsumexp(log_density))
-
-                        if args.save_grids:
-                            saved_grids.append(log_density.copy())
-
-                        ig = compute_information_gain(log_density, center_bias, target, args.resolution)
-                        auc = compute_auc(log_density, target, args.resolution)
-                        nss = compute_nss(log_density, target, args.resolution)
-                        log_nss = compute_log_nss(log_density, target, args.resolution)
-
-                        target_x = min(args.resolution - 1, max(0, target[0]))
-                        target_y = min(args.resolution - 1, max(0, target[1]))
-                        ll = float(log_density[target_y, target_x])
-
-                        fixation_metrics.append({
-                            'idx': i + 1, 'target': target,
-                            'ig': ig, 'auc': auc, 'nss': nss, 'log_nss': log_nss, 'll': ll,
-                        })
-
-                    if args.save_grids and saved_grids:
-                        grids_dir = output_dir / "grids"
-                        grids_dir.mkdir(exist_ok=True)
-                        np.savez_compressed(
-                            grids_dir / f"sample_{idx:05d}.npz",
-                            grids=np.stack(saved_grids).astype(np.float16),
-                            gt_fixations=np.array(gt_fixations, dtype=np.int16),
-                            image=image_path,
-                        )
-
-                    if fixation_metrics:
-                        result['lp_mean_ig'] = np.mean([m['ig'] for m in fixation_metrics])
-                        result['lp_mean_auc'] = np.mean([m['auc'] for m in fixation_metrics])
-                        result['lp_mean_nss'] = np.mean([m['nss'] for m in fixation_metrics])
-                        if fixation_metrics[0].get('log_nss') is not None:
-                            result['lp_mean_log_nss'] = np.mean([m['log_nss'] for m in fixation_metrics])
-                        result['lp_mean_ll'] = np.mean([m['ll'] for m in fixation_metrics])
-                        result['lp_fixation_metrics'] = fixation_metrics
-
-                        _elapsed = _time.time() - _group_t0
-                        print(
-                            f"    Sample {idx} [grid]: "
-                            f"IG={result['lp_mean_ig']:.2f}, "
-                            f"AUC={result['lp_mean_auc']:.4f}, "
-                            f"LL={result['lp_mean_ll']:.2f}  "
-                            f"({_elapsed:.1f}s)",
-                            flush=True
-                        )
-
-            # =================================================================
-            # FAST MODE
-            # =================================================================
-            elif args.metric_mode == 'fast':
-                xy_sep = saliency_computer._xy_separator or ", "
-
-                for (idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations), result in zip(
-                    valid_entries, group_results
-                ):
-                    gt_transition_info = []
-                    gt_base_prompts = []
-                    gt_mm_data = None
-
-                    # Use temporal/duration fixations for formatting if available
-                    fmt_fixations = gt_temporal if gt_temporal else (gt_durations if gt_durations else gt_fixations)
-
-                    for i in range(1, len(gt_fixations)):
-                        previous = fmt_fixations[:i]
-                        target = gt_fixations[i]
-                        partial_base = saliency_computer.format_partial_scanpath(
-                            previous, xy_separator=xy_sep,
-                            temporal=is_temporal,
-                            durations=is_durations,
-                        )
-                        bp, md = saliency_computer.build_prompt(
-                            image, text_prompt, shot_examples, partial_base
-                        )
-                        if gt_mm_data is None:
-                            gt_mm_data = md
-                        gt_base_prompts.append(bp)
-                        tinfo = {
-                            'scanpath_idx': 0,
-                            'fixation_idx': i,
-                            'gt_target': target,
-                            'base_prompt': bp,
-                        }
-                        if gt_temporal:
-                            tinfo['gt_timestamp'] = gt_temporal[i][2]
-                        if gt_durations:
-                            tinfo['gt_duration'] = gt_durations[i][2]
-                        gt_transition_info.append(tinfo)
-
-                    if not gt_transition_info:
-                        result['lp_mean_ll'] = None
-                        result['lp_fixation_lls'] = []
+                    valid_mask = np.isfinite(log_density)
+                    if not valid_mask.any():
                         continue
+                    log_density = log_density - min(0.0, logsumexp(log_density[valid_mask]))
 
-                    # Detect separator if needed
-                    if saliency_computer._xy_separator is None:
-                        saliency_computer.detect_xy_separator(gt_base_prompts[0], gt_mm_data)
-                        xy_sep = saliency_computer._xy_separator
+                    if centerbias_alpha > 0:
+                        log_density = log_density + centerbias_alpha * center_bias
+                        log_density = log_density - min(0.0, logsumexp(log_density))
 
-                    # Score only GT coordinates (pass empty mc_coords)
-                    per_t_lls = saliency_computer.score_coordinates(
-                        gt_base_prompts, gt_mm_data, gt_transition_info,
-                        [], xy_sep, args.batch_size,
+                    if args.save_grids:
+                        saved_grids.append(log_density.copy())
+
+                    ig = compute_information_gain(log_density, center_bias, target, args.resolution)
+                    auc = compute_auc(log_density, target, args.resolution)
+                    nss = compute_nss(log_density, target, args.resolution)
+                    log_nss = compute_log_nss(log_density, target, args.resolution)
+
+                    target_x = min(args.resolution - 1, max(0, target[0]))
+                    target_y = min(args.resolution - 1, max(0, target[1]))
+                    ll = float(log_density[target_y, target_x])
+
+                    fixation_metrics.append({
+                        'idx': i + 1, 'target': target,
+                        'ig': ig, 'auc': auc, 'nss': nss, 'log_nss': log_nss, 'll': ll,
+                    })
+
+                if args.save_grids and saved_grids:
+                    grids_dir = output_dir / "grids"
+                    grids_dir.mkdir(exist_ok=True)
+                    np.savez_compressed(
+                        grids_dir / f"sample_{idx:05d}.npz",
+                        grids=np.stack(saved_grids).astype(np.float16),
+                        gt_fixations=np.array(gt_fixations, dtype=np.int16),
+                        image=image_path,
                     )
 
-                    lls = [
-                        per_t_lls[t].get(gt_transition_info[t]['gt_target'], -20.0)
-                        for t in range(len(gt_transition_info))
-                    ]
-
-                    log_z = args.log_z if args.log_z is not None else 0.0
-                    igs = []
-                    norm_lls = []
-                    for t, tinfo in enumerate(gt_transition_info):
-                        norm_ll = lls[t] - log_z
-                        norm_lls.append(norm_ll)
-                        x_gt, y_gt = tinfo['gt_target']
-                        x_idx = min(args.resolution - 1, max(0, x_gt))
-                        y_idx = min(args.resolution - 1, max(0, y_gt))
-                        log_cb = center_bias[y_idx, x_idx]
-                        ig = (norm_ll - log_cb) / np.log(2)
-                        igs.append(ig)
-
-                    result['lp_mean_ig'] = np.mean(igs) if igs else None
-                    result['lp_fixation_igs'] = igs
-                    result['lp_mean_ll'] = np.mean(norm_lls) if norm_lls else None
-                    result['lp_fixation_lls'] = norm_lls
-                    result['log_z'] = log_z
-
-                    # Temporal scoring: score GT timestamp digits
-                    if is_temporal and gt_temporal:
-                        temporal_lls = saliency_computer.score_temporal_gt(
-                            gt_base_prompts, gt_mm_data, gt_transition_info,
-                            xy_sep, args.batch_size,
-                        )
-                        result['temporal_fixation_lls'] = temporal_lls
-                        result['temporal_mean_ll'] = np.mean(temporal_lls) if temporal_lls else None
-
-                    # Duration scoring: score GT duration digits + greedy prediction
-                    if is_durations and gt_durations:
-                        duration_lls = saliency_computer.score_duration_gt(
-                            gt_base_prompts, gt_mm_data, gt_transition_info,
-                            xy_sep, args.batch_size,
-                        )
-                        result['duration_fixation_lls'] = duration_lls
-                        result['duration_mean_ll'] = np.mean(duration_lls) if duration_lls else None
-
-                        # Greedy duration prediction + MSE
-                        pred_durations = saliency_computer.predict_duration_greedy(
-                            gt_base_prompts, gt_mm_data, gt_transition_info,
-                            xy_sep, args.batch_size,
-                        )
-                        gt_durs = [tinfo['gt_duration'] for tinfo in gt_transition_info]
-                        duration_errors = [(p - g) ** 2 for p, g in zip(pred_durations, gt_durs)]
-                        result['duration_pred'] = pred_durations
-                        result['duration_gt'] = gt_durs
-                        result['duration_mse'] = np.mean(duration_errors) if duration_errors else None
-
-                        # Debug: print GT vs pred when MSE is suspicious
-                        if result['duration_mse'] is not None and (
-                            result['duration_mse'] == 0 or result['duration_mse'] > 100000
-                        ):
-                            print(f"      DEBUG DMSE={result['duration_mse']:.0f}: "
-                                  f"GT={gt_durs}, pred={pred_durations}", flush=True)
+                if fixation_metrics:
+                    result['lp_mean_ig'] = np.mean([m['ig'] for m in fixation_metrics])
+                    result['lp_mean_auc'] = np.mean([m['auc'] for m in fixation_metrics])
+                    result['lp_mean_nss'] = np.mean([m['nss'] for m in fixation_metrics])
+                    if fixation_metrics[0].get('log_nss') is not None:
+                        result['lp_mean_log_nss'] = np.mean([m['log_nss'] for m in fixation_metrics])
+                    result['lp_mean_ll'] = np.mean([m['ll'] for m in fixation_metrics])
+                    result['lp_fixation_metrics'] = fixation_metrics
 
                     _elapsed = _time.time() - _group_t0
-                    _z_label = f"logZ={args.log_z}" if args.log_z is not None else "Z~1"
-                    _temporal_str = ""
-                    if is_temporal and result.get('temporal_mean_ll') is not None:
-                        _temporal_str = f", TLL={result['temporal_mean_ll']:.2f}"
-                    if is_durations and result.get('duration_mean_ll') is not None:
-                        _mse_str = f", DMSE={result['duration_mse']:.0f}" if result.get('duration_mse') is not None else ""
-                        _temporal_str = f", DLL={result['duration_mean_ll']:.2f}{_mse_str}"
                     print(
-                        f"    Sample {idx} [{_z_label}]: "
+                        f"    Sample {idx} [grid]: "
                         f"IG={result['lp_mean_ig']:.2f}, "
-                        f"LL={result['lp_mean_ll']:.2f}"
-                        f"{_temporal_str}  "
+                        f"AUC={result['lp_mean_auc']:.4f}, "
+                        f"LL={result['lp_mean_ll']:.2f}  "
                         f"({_elapsed:.1f}s)",
                         flush=True
                     )
 
-            # Save results for this image group
-            all_results.extend(group_results)
-            completed_sample_indices.update(r['idx'] for r in group_results)
-            _save_results_json()
+        # =================================================================
+        # FAST MODE
+        # =================================================================
+        elif args.metric_mode == 'fast':
+            xy_sep = saliency_computer._xy_separator or ", "
 
-        except Exception as e:
-            print(f"Error on image {image_path}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+            for (idx, sample, text_prompt, gt_fixations, gt_temporal, gt_durations), result in zip(
+                valid_entries, group_results
+            ):
+                gt_transition_info = []
+                gt_base_prompts = []
+                gt_mm_data = None
+
+                # Use temporal/duration fixations for formatting if available
+                fmt_fixations = gt_temporal if gt_temporal else (gt_durations if gt_durations else gt_fixations)
+
+                for i in range(1, len(gt_fixations)):
+                    previous = fmt_fixations[:i]
+                    target = gt_fixations[i]
+                    partial_base = saliency_computer.format_partial_scanpath(
+                        previous, xy_separator=xy_sep,
+                        temporal=is_temporal,
+                        durations=is_durations,
+                    )
+                    bp, md = saliency_computer.build_prompt(
+                        image, text_prompt, shot_examples, partial_base
+                    )
+                    if gt_mm_data is None:
+                        gt_mm_data = md
+                    gt_base_prompts.append(bp)
+                    tinfo = {
+                        'scanpath_idx': 0,
+                        'fixation_idx': i,
+                        'gt_target': target,
+                        'base_prompt': bp,
+                    }
+                    if gt_temporal:
+                        tinfo['gt_timestamp'] = gt_temporal[i][2]
+                    if gt_durations:
+                        tinfo['gt_duration'] = gt_durations[i][2]
+                    gt_transition_info.append(tinfo)
+
+                if not gt_transition_info:
+                    result['lp_mean_ll'] = None
+                    result['lp_fixation_lls'] = []
+                    continue
+
+                # Detect separator if needed
+                if saliency_computer._xy_separator is None:
+                    saliency_computer.detect_xy_separator(gt_base_prompts[0], gt_mm_data)
+                    xy_sep = saliency_computer._xy_separator
+
+                # Score only GT coordinates (pass empty mc_coords)
+                per_t_lls = saliency_computer.score_coordinates(
+                    gt_base_prompts, gt_mm_data, gt_transition_info,
+                    [], xy_sep, args.batch_size,
+                )
+
+                lls = [
+                    per_t_lls[t].get(gt_transition_info[t]['gt_target'], -20.0)
+                    for t in range(len(gt_transition_info))
+                ]
+
+                log_z = args.log_z if args.log_z is not None else 0.0
+                igs = []
+                norm_lls = []
+                for t, tinfo in enumerate(gt_transition_info):
+                    norm_ll = lls[t] - log_z
+                    norm_lls.append(norm_ll)
+                    x_gt, y_gt = tinfo['gt_target']
+                    x_idx = min(args.resolution - 1, max(0, x_gt))
+                    y_idx = min(args.resolution - 1, max(0, y_gt))
+                    log_cb = center_bias[y_idx, x_idx]
+                    ig = (norm_ll - log_cb) / np.log(2)
+                    igs.append(ig)
+
+                result['lp_mean_ig'] = np.mean(igs) if igs else None
+                result['lp_fixation_igs'] = igs
+                result['lp_mean_ll'] = np.mean(norm_lls) if norm_lls else None
+                result['lp_fixation_lls'] = norm_lls
+                result['log_z'] = log_z
+
+                # Temporal scoring: score GT timestamp digits
+                if is_temporal and gt_temporal:
+                    temporal_lls = saliency_computer.score_temporal_gt(
+                        gt_base_prompts, gt_mm_data, gt_transition_info,
+                        xy_sep, args.batch_size,
+                    )
+                    result['temporal_fixation_lls'] = temporal_lls
+                    result['temporal_mean_ll'] = np.mean(temporal_lls) if temporal_lls else None
+
+                # Duration scoring: score GT duration digits + greedy prediction
+                if is_durations and gt_durations:
+                    duration_lls = saliency_computer.score_duration_gt(
+                        gt_base_prompts, gt_mm_data, gt_transition_info,
+                        xy_sep, args.batch_size,
+                    )
+                    result['duration_fixation_lls'] = duration_lls
+                    result['duration_mean_ll'] = np.mean(duration_lls) if duration_lls else None
+
+                    # Greedy duration prediction + MSE
+                    pred_durations = saliency_computer.predict_duration_greedy(
+                        gt_base_prompts, gt_mm_data, gt_transition_info,
+                        xy_sep, args.batch_size,
+                    )
+                    gt_durs = [tinfo['gt_duration'] for tinfo in gt_transition_info]
+                    duration_errors = [(p - g) ** 2 for p, g in zip(pred_durations, gt_durs)]
+                    result['duration_pred'] = pred_durations
+                    result['duration_gt'] = gt_durs
+                    result['duration_mse'] = np.mean(duration_errors) if duration_errors else None
+
+                    # Debug: print GT vs pred when MSE is suspicious
+                    if result['duration_mse'] is not None and (
+                        result['duration_mse'] == 0 or result['duration_mse'] > 100000
+                    ):
+                        print(f"      DEBUG DMSE={result['duration_mse']:.0f}: "
+                              f"GT={gt_durs}, pred={pred_durations}", flush=True)
+
+                _elapsed = _time.time() - _group_t0
+                _z_label = f"logZ={args.log_z}" if args.log_z is not None else "Z~1"
+                _temporal_str = ""
+                if is_temporal and result.get('temporal_mean_ll') is not None:
+                    _temporal_str = f", TLL={result['temporal_mean_ll']:.2f}"
+                if is_durations and result.get('duration_mean_ll') is not None:
+                    _mse_str = f", DMSE={result['duration_mse']:.0f}" if result.get('duration_mse') is not None else ""
+                    _temporal_str = f", DLL={result['duration_mean_ll']:.2f}{_mse_str}"
+                print(
+                    f"    Sample {idx} [{_z_label}]: "
+                    f"IG={result['lp_mean_ig']:.2f}, "
+                    f"LL={result['lp_mean_ll']:.2f}"
+                    f"{_temporal_str}  "
+                    f"({_elapsed:.1f}s)",
+                    flush=True
+                )
+
+        # Save results for this image group
+        all_results.extend(group_results)
+        completed_sample_indices.update(r['idx'] for r in group_results)
+        _save_results_json()
+
 
     # =========================================================================
     # Aggregate results
@@ -3064,40 +3133,14 @@ def main():
     print(f"Num shots: {args.num_shots}")
     print(f"Shot strategy: {args.shot_strategy}")
     print(f"Centerbias alpha: {centerbias_alpha}")
+    print(f"Centerbias (IG baseline): {'data (' + args.pkl_dir + ')' if use_data_centerbias else 'synthetic Gaussian'}")
 
-    if all_results:
-        lp_igs = [r['lp_mean_ig'] for r in all_results if r.get('lp_mean_ig') is not None]
-        if lp_igs:
-            print(f"\n--- {args.metric_mode.upper()} Metrics ---")
-            print(f"  IG:  {np.mean(lp_igs):.3f} +/- {np.std(lp_igs):.3f}")
-        lp_aucs = [r['lp_mean_auc'] for r in all_results if r.get('lp_mean_auc') is not None]
-        if lp_aucs:
-            print(f"  AUC: {np.mean(lp_aucs):.4f} +/- {np.std(lp_aucs):.4f}")
-        lp_nsss = [r['lp_mean_nss'] for r in all_results if r.get('lp_mean_nss') is not None]
-        if lp_nsss:
-            print(f"  NSS: {np.mean(lp_nsss):.3f} +/- {np.std(lp_nsss):.3f}")
-        lp_nss_corr = [r['lp_mean_nss_corrected'] for r in all_results if r.get('lp_mean_nss_corrected') is not None]
-        if lp_nss_corr:
-            print(f"  NSS (corrected): {np.mean(lp_nss_corr):.3f} +/- {np.std(lp_nss_corr):.3f}")
-        lp_log_nsss = [r['lp_mean_log_nss'] for r in all_results if r.get('lp_mean_log_nss') is not None]
-        if lp_log_nsss:
-            print(f"  LogNSS: {np.mean(lp_log_nsss):.3f} +/- {np.std(lp_log_nsss):.3f}")
-        lp_ms_nsss = [r['lp_mean_ms_nss'] for r in all_results if r.get('lp_mean_ms_nss') is not None]
-        if lp_ms_nsss:
-            print(f"  MS-NSS: {np.mean(lp_ms_nsss):.3f} +/- {np.std(lp_ms_nsss):.3f}")
-        lp_lls = [r.get('lp_mean_ll') for r in all_results if r.get('lp_mean_ll') is not None]
-        if lp_lls:
-            print(f"  LL:  {np.mean(lp_lls):.3f} +/- {np.std(lp_lls):.3f}")
-        temporal_lls = [r.get('temporal_mean_ll') for r in all_results if r.get('temporal_mean_ll') is not None]
-        if temporal_lls:
-            print(f"  Temporal LL: {np.mean(temporal_lls):.3f} +/- {np.std(temporal_lls):.3f}")
-        duration_lls = [r.get('duration_mean_ll') for r in all_results if r.get('duration_mean_ll') is not None]
-        if duration_lls:
-            print(f"  Duration LL: {np.mean(duration_lls):.3f} +/- {np.std(duration_lls):.3f}")
-        duration_mses = [r.get('duration_mse') for r in all_results if r.get('duration_mse') is not None]
-        if duration_mses:
-            print(f"  Duration MSE: {np.mean(duration_mses):.1f} +/- {np.std(duration_mses):.1f}")
-            print(f"  Duration RMSE: {np.sqrt(np.mean(duration_mses)):.1f} ms")
+    summary = summarize_results(all_results)
+    num_unscored = sum(
+        len(parse_scanpath_reduced(sample['conversations'][1]['value'])) < 2 for sample in val_data
+    )
+    print(f"Scored {len(all_results)} scanpaths; {num_unscored} with fewer than 2 fixations have nothing to score")
+    print_summary(summary)
 
     # =========================================================================
     # Visualization (grid mode only)
@@ -3111,7 +3154,7 @@ def main():
             resolution=args.resolution,
         )
 
-    _save_results_json()
+    _save_results_json(summary)
     print(f"\nResults saved to {results_file}")
 
 
